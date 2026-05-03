@@ -122,13 +122,14 @@ troubleshooting.
 
 ## Performance Results
 
-Measured on Ascend 910B4 with Qwen3.5-0.8B (BF16, eager mode, single device):
+Measured on Ascend 910B4 with Qwen3.5-0.8B (BF16, eager mode, single device,
+**rebuilt from source using this PR**):
 
 | Backend | 512 tok TTFT | 1024 tok TTFT | 4096 tok TTFT |
 |---|---|---|---|
-| Triton (default)  | 127 ms | 126 ms | 135 ms |
-| PTO megakernel    | 111 ms | 112 ms | 124 ms |
-| **Speedup**       | **1.15×** | **1.12×** | **1.09×** |
+| Triton (default)  | 125.8 ms | 125.3 ms | 133.8 ms |
+| PTO megakernel    | 110.6 ms | 111.7 ms | 119.9 ms |
+| **Speedup**       | **1.14×** | **1.12×** | **1.12×** |
 
 For larger models (Qwen3.6-35B-A3B-MoE) where GDN layers dominate, speedups
 reach **~25% at 4k+ tokens**.
@@ -137,7 +138,8 @@ reach **~25% at 4k+ tokens**.
 
 ## Accuracy Results (Qwen3.5-0.8B)
 
-256-document wikitext subset + 6-subject MMLU:
+256-document wikitext subset + 6-subject MMLU
+(**rebuilt from source using this PR**):
 
 | Backend | WikiText PPL ↓ | MMLU acc ↑ |
 |---|---|---|
@@ -181,3 +183,151 @@ python -m lm_eval --model vllm \
 - `VLLM_ASCEND_PTO_CHUNK_GDN` is registered in `vllm_ascend/envs.py`; the
   "Unknown vLLM environment variable" warning from vLLM core is harmless.
 - The JIT cache directory (`kernels/compiled_lib/*.so`) is listed in `.gitignore`.
+
+---
+
+## How to Rebuild from Source
+
+### Prerequisites
+
+- Ascend 910B device with CANN ≥ 8.0 and `bisheng` compiler in `PATH`
+- Ubuntu 22.04 (recommended) with Python 3.11
+- Activate the toolkit: `source /usr/local/Ascend/ascend-toolkit/set_env.sh`
+
+### Build steps
+
+```bash
+# 1 — Clone with submodules
+git clone https://github.com/vllm-project/vllm-ascend.git
+cd vllm-ascend
+git submodule update --init --recursive   # pulls pto-isa and catlass
+
+# 2 — Install vLLM (empty device build — no GPU/CUDA needed)
+git clone --depth 1 -b v0.19.1 https://github.com/vllm-project/vllm.git /tmp/vllm
+VLLM_TARGET_DEVICE=empty pip install -e /tmp/vllm/ \
+    --extra-index-url https://download.pytorch.org/whl/cpu/
+pip uninstall -y triton
+
+# 3 — Install vllm-ascend
+pip install -e . \
+    --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
+    --extra-index-url https://download.pytorch.org/whl/cpu/
+pip uninstall -y triton triton-ascend
+pip install triton-ascend==3.2.0
+
+# 4 — (Optional) Pre-compile PTO megakernel for common Qwen configs
+cmake -S csrc -B csrc/build -DBUILD_PTO_CHUNK_GDN=ON
+cmake --build csrc/build --target pto_chunk_gdn_kernels -j$(nproc)
+```
+
+### Run inference with PTO
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 \
+VLLM_ASCEND_PTO_CHUNK_GDN=1 \
+python -m vllm.entrypoints.openai.api_server \
+    --model /path/to/Qwen3.5-7B \
+    --max-model-len 8192
+```
+
+### Run accuracy check (lm-eval)
+
+```bash
+pip install lm-eval sacrebleu more-itertools datasets
+
+# Triton baseline
+ASCEND_RT_VISIBLE_DEVICES=0 python -m lm_eval \
+    --model vllm \
+    --model_args "pretrained=/path/to/Qwen3.5-0.8B,gpu_memory_utilization=0.85,enforce_eager=True" \
+    --tasks "wikitext" --limit 256 --output_path results/triton.json
+
+# PTO megakernel
+ASCEND_RT_VISIBLE_DEVICES=0 VLLM_ASCEND_PTO_CHUNK_GDN=1 python -m lm_eval \
+    --model vllm \
+    --model_args "pretrained=/path/to/Qwen3.5-0.8B,gpu_memory_utilization=0.85,enforce_eager=True" \
+    --tasks "wikitext" --limit 256 --output_path results/pto.json
+```
+
+---
+
+## Minimum Dockerfile
+
+A minimum `Dockerfile.pto` is included at the repository root for building a
+self-contained image with CANN 8.5.1, vLLM v0.19.1, and vllm-ascend with PTO
+pre-compiled for common Qwen configurations.
+
+```dockerfile
+FROM quay.io/ascend/cann:8.5.1-910b-ubuntu22.04-py3.11
+
+ARG PIP_INDEX_URL="https://pypi.org/simple"
+ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
+ARG VLLM_TAG="v0.19.1"
+ARG SOC_VERSION="ascend910b4"
+
+WORKDIR /workspace
+
+# System packages
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        git cmake ninja-build gcc g++ wget numactl libnuma-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip config set global.index-url ${PIP_INDEX_URL}
+
+# vLLM (empty-device build)
+RUN git clone --depth 1 -b ${VLLM_TAG} ${VLLM_REPO} /workspace/vllm && \
+    VLLM_TARGET_DEVICE="empty" pip install -v -e /workspace/vllm/ \
+        --extra-index-url https://download.pytorch.org/whl/cpu/ && \
+    pip uninstall -y triton && pip cache purge
+
+# vllm-ascend with pto-isa submodule
+COPY . /workspace/vllm-ascend/
+RUN cd /workspace/vllm-ascend && \
+    git submodule update --init --recursive csrc/third_party/pto-isa
+
+ENV SOC_VERSION=${SOC_VERSION} TASK_QUEUE_ENABLE=1 OMP_NUM_THREADS=1
+
+RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    source /usr/local/Ascend/nnal/atb/set_env.sh 2>/dev/null || true && \
+    export PIP_EXTRA_INDEX_URL=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
+    pip install -v -e /workspace/vllm-ascend/ \
+        --extra-index-url https://download.pytorch.org/whl/cpu/ && \
+    pip uninstall -y triton triton-ascend 2>/dev/null || true && \
+    pip install -v triton-ascend==3.2.0 && pip cache purge
+
+# Pre-compile PTO megakernel (optional — remove to rely on JIT)
+RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    cmake -S /workspace/vllm-ascend/csrc \
+          -B /workspace/vllm-ascend/csrc/build \
+          -DBUILD_PTO_CHUNK_GDN=ON -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build /workspace/vllm-ascend/csrc/build \
+          --target pto_chunk_gdn_kernels -j$(nproc) && \
+    rm -rf /workspace/vllm-ascend/csrc/build
+
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    VLLM_ASCEND_PTO_CHUNK_GDN=1
+
+RUN echo "source /usr/local/Ascend/ascend-toolkit/set_env.sh" >> ~/.bashrc
+
+CMD ["/bin/bash"]
+```
+
+Build and run:
+
+```bash
+# Build image (from vllm-ascend repo root)
+docker build --build-arg SOC_VERSION=ascend910b4 \
+    -t vllm-ascend-pto:latest -f Dockerfile.pto .
+
+# Run inference
+docker run --rm -it \
+    --device /dev/davinci0 --device /dev/davinci_manager \
+    --device /dev/devmm_svm --device /dev/hisi_hdc \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64 \
+    -v /path/to/model:/model \
+    vllm-ascend-pto:latest \
+    python -m vllm.entrypoints.openai.api_server \
+        --model /model --max-model-len 8192
+```
