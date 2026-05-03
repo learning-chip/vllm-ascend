@@ -14,9 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""Bisheng JIT compilation for PTO GDN kernels on Ascend NPU.
+"""Bisheng JIT compilation for the PTO GDN megakernel on Ascend NPU.
 
-Kernels compile to shared libraries (.so) cached under
+The megakernel is compiled on first use and cached under
 ``vllm_ascend/ops/pto_chunk_gdn/kernels/compiled_lib/``.
 Re-compilation is triggered when the C++ source mtime changes.
 
@@ -25,7 +25,7 @@ Environment variables:
                             Auto-detected from ``csrc/third_party/pto-isa`` in the
                             package source tree, then ``/sources/pto-isa`` fallback.
     ASCEND_TOOLKIT_HOME     Ascend toolkit root (required).
-    GDN_NPU_DEVICE          NPU device used to query ``cube_core_num`` (default ``npu:0``).
+    GDN_NPU_DEVICE          NPU device for ``cube_core_num`` query (default ``npu:0``).
     VERBOSE_COMPILE         Set to ``1`` to print the full bisheng command.
     PTO_DYNAMIC_EXTRA_FLAGS Extra flags appended to every bisheng invocation.
 """
@@ -45,12 +45,10 @@ _THIS_DIR = Path(__file__).resolve().parent
 _VLLM_ASCEND_DIR = _THIS_DIR.parent.parent           # vllm_ascend/
 _PACKAGE_ROOT = _VLLM_ASCEND_DIR.parent              # site-packages root
 
-# C++ sources: csrc/pto_chunk_gdn/ inside the source checkout.
-# Walk up from the installed package root to find the source tree.
-# In editable installs (pip install -e .) this resolves to the repo.
+# C++ sources live in csrc/pto_chunk_gdn/ inside the source tree.
+# In editable installs (pip install -e .) _PACKAGE_ROOT == repo root.
 _CSRC_PTO = _PACKAGE_ROOT / "csrc" / "pto_chunk_gdn"
 if not _CSRC_PTO.is_dir():
-    # Try relative to the package directory itself (wheel install with csrc bundled)
     _CSRC_PTO = _THIS_DIR / "csrc"
 
 KERNELS_PTO: str = str(_CSRC_PTO)
@@ -72,15 +70,12 @@ if not ASCEND_TOOLKIT_HOME:
 
 
 def _resolve_pto_lib_path() -> str:
-    """Return the pto-isa header root, searching several well-known locations."""
     if "PTO_LIB_PATH" in os.environ:
         return os.environ["PTO_LIB_PATH"]
-    # Submodule inside the source tree (editable install)
     submodule = _PACKAGE_ROOT / "csrc" / "third_party" / "pto-isa"
     if (submodule / "include").is_dir():
         os.environ["PTO_LIB_PATH"] = str(submodule)
         return str(submodule)
-    # Pre-installed path used inside the reference Docker image
     fallback = "/sources/pto-isa"
     if os.path.isdir(os.path.join(fallback, "include")):
         os.environ["PTO_LIB_PATH"] = fallback
@@ -91,7 +86,7 @@ def _resolve_pto_lib_path() -> str:
 PTO_LIB_PATH: str = _resolve_pto_lib_path()
 
 # ---------------------------------------------------------------------------
-# Hardware info — query cube_core_num from device properties
+# Hardware: query cube_core_num
 # ---------------------------------------------------------------------------
 _npu_dev = os.environ.get("GDN_NPU_DEVICE", "npu:0")
 try:
@@ -103,7 +98,7 @@ except (RuntimeError, AssertionError):
 
 
 # ---------------------------------------------------------------------------
-# Compilation helpers
+# Compilation
 # ---------------------------------------------------------------------------
 
 def _common_flags(
@@ -113,7 +108,6 @@ def _common_flags(
     hidden_size: int,
     chunk_size: int,
 ) -> list[str]:
-    """Return bisheng flags shared by all chunk-GDN kernels."""
     flags = [
         "-fPIC", "-shared", "-xcce", "-DMEMORY_BASE", "-O2", "-std=gnu++17",
         "--cce-aicore-arch=dav-c220",
@@ -140,38 +134,6 @@ def _common_flags(
     return flags
 
 
-def _run_bisheng(cmd: list[str], timeout: int) -> None:
-    if os.environ.get("VERBOSE_COMPILE"):
-        print("compile:", " ".join(cmd))
-    subprocess.run(cmd, check=True, timeout=timeout)
-
-
-@lru_cache(maxsize=None)
-def compile_chunk_kernel(
-    cpp_basename: str,
-    so_stem: str,
-    *,
-    num_heads: int,
-    hidden_size: int = 128,
-    chunk_size: int = 128,
-    key_heads: int | None = None,
-    cpp_mtime_ns: int = 0,
-) -> str:
-    """Compile a chunk-GDN kernel and return the path to the resulting ``.so``."""
-    kh = key_heads if key_heads is not None else num_heads
-    os.makedirs(COMPILED_DIR, exist_ok=True)
-    cpp_path = os.path.join(KERNELS_PTO, cpp_basename)
-    lib_path = os.path.join(
-        COMPILED_DIR,
-        f"{so_stem}_H{num_heads}_Hg{kh}_D{hidden_size}_C{chunk_size}.so",
-    )
-    flags = _common_flags(
-        num_heads=num_heads, key_heads=kh, hidden_size=hidden_size, chunk_size=chunk_size
-    )
-    _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=300)
-    return lib_path
-
-
 @lru_cache(maxsize=None)
 def compile_mega_kernel(
     *,
@@ -181,7 +143,18 @@ def compile_mega_kernel(
     chunk_size: int = 128,
     cpp_mtime_ns: int = 0,
 ) -> str:
-    """Compile the fused mega-kernel and return the path to the resulting ``.so``."""
+    """Compile the fused PTO GDN megakernel and return the ``.so`` path.
+
+    Args:
+        num_heads:   Number of value heads H.
+        key_heads:   Number of Q/K heads Hg (GQA; defaults to H if None).
+        hidden_size: Head dimension D.
+        chunk_size:  Chunk size C (must be 128).
+        cpp_mtime_ns: Source file mtime for cache invalidation.
+
+    Returns:
+        Absolute path to the compiled ``.so`` file.
+    """
     kh = key_heads if key_heads is not None else num_heads
     os.makedirs(COMPILED_DIR, exist_ok=True)
     cpp_path = os.path.join(KERNELS_PTO, "mega_kernel.cpp")
@@ -192,26 +165,13 @@ def compile_mega_kernel(
     flags = _common_flags(
         num_heads=num_heads, key_heads=kh, hidden_size=hidden_size, chunk_size=chunk_size
     )
+    cmd = ["bisheng", *flags, cpp_path, "-o", lib_path]
+    if os.environ.get("VERBOSE_COMPILE"):
+        print("compile:", " ".join(cmd))
     import logging
     logging.getLogger(__name__).info(
-        "[pto_chunk_gdn] Compiling mega_kernel H=%d Hg=%d …", num_heads, kh
+        "[pto_chunk_gdn] Compiling mega_kernel H=%d Hg=%d D=%d C=%d …",
+        num_heads, kh, hidden_size, chunk_size,
     )
-    _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=600)
-    return lib_path
-
-
-@lru_cache(maxsize=None)
-def compile_tri_inverse(cpp_mtime_ns: int = 0) -> str:
-    """Compile the triangular-inverse CubeCore kernel and return the ``.so`` path."""
-    os.makedirs(COMPILED_DIR, exist_ok=True)
-    cpp_path = os.path.join(KERNELS_PTO, "tri_inverse.cpp")
-    lib_path = os.path.join(COMPILED_DIR, "tri_inverse_jit.so")
-    flags = [
-        "-fPIC", "-shared", "-xcce", "-DMEMORY_BASE", "-O2", "-std=c++17",
-        f"-I{KERNEL_INCLUDE}",
-        f"-I{os.path.join(PTO_LIB_PATH, 'include')}",
-        "--cce-soc-version=Ascend910B4",
-        "--cce-soc-core-type=CubeCore",
-    ]
-    _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=180)
+    subprocess.run(cmd, check=True, timeout=600)
     return lib_path

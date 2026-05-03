@@ -14,39 +14,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""PTO-backed ``chunk_gated_delta_rule`` drop-in for vLLM-Ascend prefill.
+"""PTO megakernel drop-in for ``chunk_gated_delta_rule`` — prefill only.
 
-Activated via ``VLLM_ASCEND_ENABLE_PTO_GDN=1``.  Falls back transparently to
+Activated via ``VLLM_ASCEND_PTO_CHUNK_GDN=1``.  Falls back transparently to
 the Triton implementation for:
-  - Non-zero ``initial_state`` (recurrent decode with prior state)
+  - Non-zero ``initial_state`` (decode step with prior recurrent state)
   - Missing ``cu_seqlens`` (non-varlen path)
   - Multi-device pipeline-parallel (PCP) groups (world_size > 1)
   - Mismatched Q/K/V head dimensions
   - Non-NPU device
 
-Two execution modes (controlled by ``VLLM_ASCEND_PTO_GDN_MEGAKERNEL``):
-  - **Staged** (default): six separate JIT-compiled kernel launches.
-  - **Megakernel** (set to ``1``): single fused launch (maximum throughput).
-
 GQA is supported: if ``v.shape[2] > q.shape[2]`` the GQA path is taken.
-The PTO path only executes for the **prefill** chunk computation; the decode
-path (``initial_state != 0``) always falls back to Triton.
+
+The PTO path only executes for **prefill** (zero initial_state, cu_seqlens
+present).  Decode transparently falls back to Triton so normal inference
+(prefill + decode) works correctly end-to-end.
 """
 from __future__ import annotations
 
-import os
-from functools import lru_cache
-
 import torch
 from einops import rearrange
-
-C_PTO = 128
-
-
-@lru_cache(maxsize=1)
-def _pto_tri_inverse_cached():
-    from vllm_ascend.ops.pto_chunk_gdn.fast_inverse import load_tri_inverse
-    return load_tri_inverse()
 
 
 def _needs_triton_fallback(
@@ -56,125 +43,6 @@ def _needs_triton_fallback(
     if initial_state is not None and torch.any(initial_state != 0):
         return True
     return cu_seqlens is None
-
-
-def _is_gqa(q: torch.Tensor, v: torch.Tensor) -> bool:
-    return v.shape[2] != q.shape[2]
-
-
-def _head_dims_compatible(q: torch.Tensor, v: torch.Tensor) -> bool:
-    return q.shape[3] == v.shape[3]
-
-
-def _megakernel_enabled() -> bool:
-    from vllm_ascend import envs
-    return bool(envs.VLLM_ASCEND_PTO_CHUNK_GDN_MEGAKERNEL)
-
-
-def _staged_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    cu32: torch.Tensor,
-    scale: float,
-    *,
-    Hg: int,
-    H: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    from vllm_ascend.ops.pto_chunk_gdn.fast_inverse import solve_tril
-    from vllm_ascend.ops.pto_chunk_gdn.kernel_libs import (
-        chunk_gdn_causal_masks,
-        run_chunk_cumsum,
-        run_chunk_h,
-        run_chunk_o,
-        run_scaled_dot_kkt,
-        run_wy_fast,
-        total_chunks,
-        transpose_beta,
-        transpose_gates,
-    )
-
-    dev = q.device
-    T = q.shape[1]
-    D = q.shape[3]
-    N_seq = int(cu32.numel()) - 1
-    stream = torch.npu.current_stream()._as_parameter_
-
-    dt, di = dev.type, dev.index if dev.index is not None else -1
-    msk_lower, msk_full = chunk_gdn_causal_masks(dt, di, C_PTO)
-
-    g_sum = torch.empty(1, T, H, device=dev, dtype=torch.float32)
-    run_chunk_cumsum(g.float(), g_sum, stream=stream, chunk_size=C_PTO,
-                     cu_seqlens=cu32, batch_size_override=N_seq)
-    g_t = transpose_gates(g_sum)
-    beta_t = transpose_beta(beta)
-    torch.npu.synchronize()
-
-    A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16)
-    with torch.autograd.profiler.record_function("PTO_kkt"):
-        run_scaled_dot_kkt(k, beta, g_sum, msk_lower, A,
-                           stream=stream, g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
-                           cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg)
-    torch.npu.synchronize()
-
-    with torch.autograd.profiler.record_function("PTO_solve_tril"):
-        A_inv = solve_tril(A, cu32, C_PTO, H, _pto_tri_inverse_cached())
-    torch.npu.synchronize()
-
-    w = torch.empty_like(v)
-    u = torch.empty_like(v)
-    with torch.autograd.profiler.record_function("PTO_wy_fast"):
-        run_wy_fast(k, v, beta, g_sum, A_inv, w, u,
-                    stream=stream, g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
-                    cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg)
-    torch.npu.synchronize()
-
-    tc_n = total_chunks(N_seq, T, C_PTO, cu32)
-    s = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
-    v_new = torch.empty_like(v)
-    fs = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
-    with torch.autograd.profiler.record_function("PTO_chunk_h"):
-        run_chunk_h(k, w, u, g_sum, s, v_new, fs,
-                    stream=stream, g_t=g_t, chunk_size=C_PTO,
-                    cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg)
-    torch.npu.synchronize()
-
-    o = torch.empty_like(v)
-    with torch.autograd.profiler.record_function("PTO_chunk_o"):
-        run_chunk_o(q, k, v_new, s, g_sum, msk_full, o,
-                    stream=stream, g_t=g_t, chunk_size=C_PTO,
-                    cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg)
-    torch.npu.synchronize()
-
-    return (o * scale).to(q.dtype), fs.view(N_seq, H, D, D).to(q.dtype)
-
-
-def _mega_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    cu32: torch.Tensor,
-    scale: float,
-    *,
-    Hg: int,
-    output_final_state: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    from vllm_ascend.ops.pto_chunk_gdn.mega_kernel import run_mega_kernel
-    stream = torch.npu.current_stream()._as_parameter_
-    with torch.autograd.profiler.record_function("PTO_mega_kernel"):
-        result = run_mega_kernel(
-            q, k, v, g.float(), beta, cu32,
-            stream=stream, chunk_size=C_PTO, scale=scale,
-            key_heads=Hg, return_final_state=output_final_state,
-        )
-    if output_final_state:
-        o, fs = result
-        return o.to(q.dtype), fs.to(q.dtype)
-    return result.to(q.dtype), None  # type: ignore[return-value]
 
 
 @torch.compiler.disable
@@ -194,11 +62,10 @@ def chunk_gated_delta_rule_pto(
     *,
     _triton_impl,
 ):
-    """PTO drop-in for ``vllm_ascend.ops.triton.fla.chunk.chunk_gated_delta_rule``.
+    """PTO megakernel drop-in for ``chunk_gated_delta_rule``.
 
-    The PTO path only handles the **prefill** chunk computation.  Decoding
-    (``initial_state != 0``) transparently falls back to the Triton baseline,
-    so normal inference (prefill + decode) works correctly end-to-end.
+    Runs the fused Bisheng megakernel for prefill.  Falls back to Triton for
+    decode (``initial_state != 0``) so end-to-end inference is unaffected.
     """
     assert q.dtype == k.dtype == v.dtype
     assert q.dtype != torch.float32, "Use bfloat16 or float16, not float32."
@@ -214,7 +81,7 @@ def chunk_gated_delta_rule_pto(
         from vllm_ascend.ops.triton.fla.l2norm import l2norm_fwd
         q, k = l2norm_fwd(q), l2norm_fwd(k)
 
-    def _triton(*args, **kw):
+    def _triton():
         return _triton_impl(
             q, k, v, g, beta,
             scale=scale, initial_state=initial_state,
@@ -227,9 +94,9 @@ def chunk_gated_delta_rule_pto(
         return _triton()
     if _needs_triton_fallback(initial_state, cu_seqlens):
         return _triton()
-    if not _head_dims_compatible(q, v):
+    if q.shape[3] != v.shape[3]:
         return _triton()
-    if _is_gqa(q, v) and v.shape[2] % q.shape[2] != 0:
+    if v.shape[2] != q.shape[2] and v.shape[2] % q.shape[2] != 0:
         return _triton()
     try:
         from vllm.distributed import get_pcp_group
@@ -238,27 +105,35 @@ def chunk_gated_delta_rule_pto(
     except Exception:
         pass
 
-    Hg = q.shape[2]
-    H = v.shape[2]
+    from vllm_ascend.ops.pto_chunk_gdn.mega_kernel import run_mega_kernel
+
+    kh = q.shape[2]
     cu32 = cu_seqlens.to(torch.int32).contiguous()
-    q_w = q.to(torch.float16)
-    k_w = k.to(torch.float16)
-    v_w = v.to(torch.float16)
-    beta_w = beta.to(torch.float16)
-    g_w = g.float()
+    stream = torch.npu.current_stream()._as_parameter_
 
-    if _megakernel_enabled():
-        o, final_state = _mega_forward(
-            q_w, k_w, v_w, g_w, beta_w, cu32, scale, Hg=Hg,
-            output_final_state=output_final_state,
+    with torch.autograd.profiler.record_function("PTO_mega_kernel"):
+        result = run_mega_kernel(
+            q.to(torch.float16),
+            k.to(torch.float16),
+            v.to(torch.float16),
+            g.float(),
+            beta.to(torch.float16),
+            cu32,
+            stream=stream,
+            chunk_size=128,
+            scale=scale,
+            key_heads=kh,
+            return_final_state=output_final_state,
         )
+
+    if output_final_state:
+        o, fs = result
+        o = o.to(q.dtype)
+        fs = fs.to(q.dtype)
     else:
-        o, final_state = _staged_forward(q_w, k_w, v_w, g_w, beta_w, cu32, scale, Hg=Hg, H=H)
+        o = result.to(q.dtype)  # type: ignore[assignment]
+        fs = None
 
-    if not output_final_state:
-        final_state = None
-
-    o = o.to(q.dtype)
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
-    return o, final_state
+    return o, fs

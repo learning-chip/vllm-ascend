@@ -14,10 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""Fused mega-kernel: all six GDN stages in a single NPU launch.
+"""Fused PTO GDN megakernel: all six GDN pipeline stages in one NPU launch.
 
 Fuses cumsum → scaled_dot_kkt → solve_tril → wy_fast → chunk_h → chunk_o
-into one ``call_kernel`` dispatch, eliminating Python-level inter-stage overhead.
+into a single ``call_kernel`` dispatch, eliminating Python-level inter-stage
+synchronization overhead.
+
+GQA is supported: Q/K use ``Hg`` heads while V/gates use ``H ≥ Hg`` value heads
+(``H % Hg == 0``).
+
+Usage::
+
+    from vllm_ascend.ops.pto_chunk_gdn.mega_kernel import run_mega_kernel
+
+    o = run_mega_kernel(q, k, v, g, beta, cu_seqlens, stream=stream,
+                        chunk_size=128, scale=head_dim**-0.5, key_heads=Hg)
 """
 from __future__ import annotations
 
@@ -28,21 +39,62 @@ from functools import lru_cache
 import torch
 
 from vllm_ascend.ops.pto_chunk_gdn.compile import BLOCK_DIM, KERNELS_PTO, compile_mega_kernel
-from vllm_ascend.ops.pto_chunk_gdn.kernel_libs import (
-    _vp,
-    chunk_gdn_causal_masks,
-    precomputed_minus_identity,
-    total_chunks,
-)
 
+
+# ---------------------------------------------------------------------------
+# Small utilities (self-contained, no external module dependency)
+# ---------------------------------------------------------------------------
+
+def _vp(t: torch.Tensor | None) -> ctypes.c_void_p:
+    if t is None:
+        return ctypes.c_void_p()
+    return ctypes.c_void_p(t.data_ptr())
+
+
+@lru_cache(maxsize=48)
+def _precomputed_minus_identity(
+    device_ty: str, device_index: int, chunk_size: int
+) -> torch.Tensor:
+    """``[C, C]`` fp16 buffer with diagonal ``-1``, cached per (device, C)."""
+    idx = max(device_index, 0)
+    dev = torch.device(device_ty, idx) if device_ty != "cpu" else torch.device("cpu")
+    t = torch.zeros(chunk_size, chunk_size, device=dev, dtype=torch.float16)
+    t.fill_diagonal_(-1)
+    return t
+
+
+@lru_cache(maxsize=48)
+def _causal_masks(
+    device_ty: str, device_index: int, chunk_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lower-triangle and full causal masks, cached per (device, C)."""
+    idx = max(device_index, 0)
+    dev = torch.device(device_ty, idx) if device_ty != "cpu" else torch.device("cpu")
+    m_lower = torch.tril(torch.ones(chunk_size, chunk_size, device=dev), diagonal=-1).float()
+    m_full  = torch.tril(torch.ones(chunk_size, chunk_size, device=dev), diagonal=0).float()
+    return m_lower, m_full
+
+
+def _total_chunks(N_seq: int, cu_seqlens: torch.Tensor, chunk_size: int) -> int:
+    """Total number of chunks across all sequences in the varlen batch."""
+    cu = cu_seqlens.cpu().tolist()
+    return sum(
+        (cu[i + 1] - cu[i] + chunk_size - 1) // chunk_size
+        for i in range(N_seq)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kernel loading
+# ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=None)
 def _load_mega_kernel(
     *,
     num_heads: int,
-    key_heads: int | None = None,
-    hidden_size: int = 128,
-    chunk_size: int = 128,
+    key_heads: int,
+    hidden_size: int,
+    chunk_size: int,
 ) -> ctypes.CDLL:
     mtime = os.stat(os.path.join(KERNELS_PTO, "mega_kernel.cpp")).st_mtime_ns
     lib_path = compile_mega_kernel(
@@ -60,6 +112,10 @@ def _load_mega_kernel(
     return lib
 
 
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
 def run_mega_kernel(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -75,23 +131,23 @@ def run_mega_kernel(
     key_heads: int | None = None,
     return_final_state: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Run all six GDN stages in a single fused NPU kernel launch.
+    """Run all six GDN pipeline stages in a single fused NPU kernel launch.
 
     Args:
-        q, k:   ``[B, T, Hg, D]`` fp16 query/key tensors.
-        v:      ``[B, T, H, D]`` fp16 value tensor (H ≥ Hg, H % Hg == 0).
+        q, k:   ``[B, T, Hg, D]`` fp16 query / key tensors.
+        v:      ``[B, T, H, D]`` fp16 value tensor  (H ≥ Hg, H % Hg == 0).
         g_in:   ``[B, T, H]`` float32 pre-cumsum gate logits.
         beta:   ``[B, T, H]`` fp16 gate bias.
-        cu_seqlens: ``int32`` cumulative sequence lengths ``[0, …, T]``.
-        stream: NPU stream handle.
-        chunk_size: Chunk size C (default 128).
-        scale:  Output scale factor (typically ``head_dim ** -0.5``).
-        block_dim: AI-Core block count (auto-detected if None).
-        key_heads: Number of Q/K heads Hg (inferred from ``q`` if None).
-        return_final_state: If True, also return ``[N_seq, H, D, D]`` final states.
+        cu_seqlens: ``int32`` cumulative sequence-length boundaries ``[0, …, T]``.
+        stream: NPU stream handle (``torch.npu.current_stream()._as_parameter_``).
+        chunk_size: Tile side length C (must be 128).
+        scale:  Output scale (typically ``head_dim ** -0.5``).
+        block_dim: AI-Core block count; auto-detected from device if None.
+        key_heads: Q/K head count Hg (inferred from ``q`` if None).
+        return_final_state: Also return ``[N_seq, H, D, D]`` final recurrent states.
 
     Returns:
-        ``O * scale`` of shape ``[B, T, H, D]`` fp16, and optionally the final
+        ``O * scale`` of shape ``[B, T, H, D]`` fp16, and optionally final
         recurrent state ``[N_seq, H, D, D]`` fp16.
     """
     dev = q.device
@@ -106,31 +162,31 @@ def run_mega_kernel(
         cu_seqlens = cu_seqlens.to(torch.int32)
 
     dt, di = dev.type, dev.index if dev.index is not None else -1
-    msk_lower, msk_full = chunk_gdn_causal_masks(dt, di, C)
-    minus_identity = precomputed_minus_identity(dt, di, C)
+    msk_lower, msk_full = _causal_masks(dt, di, C)
+    minus_identity = _precomputed_minus_identity(dt, di, C)
 
-    tc = total_chunks(N_seq, T, C, cu_seqlens)
+    tc = _total_chunks(N_seq, cu_seqlens, C)
     num_matrices = tc * H
 
-    g_sum     = torch.empty(1, T, H, device=dev, dtype=torch.float32)
-    g_t       = torch.empty(H, T, device=dev, dtype=torch.float32)
-    beta_t    = torch.empty(H, T, device=dev, dtype=torch.float16)
-    A         = torch.zeros(1, T, H, C, device=dev, dtype=torch.float16)
-    A_inv_f32 = torch.zeros(1, T, H, C, device=dev, dtype=torch.float32)
-    A_inv     = torch.zeros(1, T, H, C, device=dev, dtype=torch.float16)
-    w         = torch.empty_like(v)
-    u         = torch.empty_like(v)
-    s         = torch.zeros(tc * H, D, D, device=dev, dtype=torch.float16)
-    v_new     = torch.empty_like(v)
-    fs        = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
-    kkt_ws    = torch.zeros(bd * 2, C, C, device=dev, dtype=torch.float16)
-    wy_ws_a1  = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
-    wy_ws_a2  = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
-    h_ws      = torch.zeros(bd * 4, D, D, device=dev, dtype=torch.float16)
-    o_ws_qk   = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
-    o_ws_qs   = torch.zeros(bd, C, D, device=dev, dtype=torch.float16)
+    g_sum      = torch.empty(1, T, H, device=dev, dtype=torch.float32)
+    g_t        = torch.empty(H, T, device=dev, dtype=torch.float32)
+    beta_t     = torch.empty(H, T, device=dev, dtype=torch.float16)
+    A          = torch.zeros(1, T, H, C, device=dev, dtype=torch.float16)
+    A_inv_f32  = torch.zeros(1, T, H, C, device=dev, dtype=torch.float32)
+    A_inv      = torch.zeros(1, T, H, C, device=dev, dtype=torch.float16)
+    w          = torch.empty_like(v)
+    u          = torch.empty_like(v)
+    s          = torch.zeros(tc * H, D, D, device=dev, dtype=torch.float16)
+    v_new      = torch.empty_like(v)
+    fs         = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
+    kkt_ws     = torch.zeros(bd * 2, C, C, device=dev, dtype=torch.float16)
+    wy_ws_a1   = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
+    wy_ws_a2   = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
+    h_ws       = torch.zeros(bd * 4, D, D, device=dev, dtype=torch.float16)
+    o_ws_qk    = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
+    o_ws_qs    = torch.zeros(bd, C, D, device=dev, dtype=torch.float16)
     o_ws_gated = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
-    o_out     = torch.empty_like(v)
+    o_out      = torch.empty_like(v)
 
     lib = _load_mega_kernel(num_heads=H, key_heads=kh, hidden_size=D, chunk_size=C)
     lib.call_kernel(

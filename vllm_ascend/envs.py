@@ -112,16 +112,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Enable PTO (Parallel Tile Operator) kernels for the chunk GatedDeltaNet (GDN)
-    # recurrent layer used in Qwen3.5 / Qwen3.6 models.  When set, Bisheng-JIT-compiled
-    # Ascend NPU kernels replace the default Triton implementation during **prefill**.
-    # The decode phase always uses the Triton baseline.  Only effective on Ascend 910B.
-    # 0 (default): use Triton baseline; 1: enable PTO kernels.
+    # Enable PTO (Parallel Tile Operator) megakernel for the chunk GatedDeltaNet (GDN)
+    # recurrent layer used in Qwen3.5 / Qwen3.6 models.  When set, a Bisheng-JIT-compiled
+    # fused Ascend NPU megakernel replaces the default Triton implementation during
+    # **prefill**.  The decode phase always uses the Triton baseline.
+    # Only effective on Ascend 910B.  0 (default): Triton; 1: PTO megakernel.
     "VLLM_ASCEND_PTO_CHUNK_GDN": lambda: bool(int(os.getenv("VLLM_ASCEND_PTO_CHUNK_GDN", "0"))),
-    # Use the fused PTO megakernel (single NPU launch, all six GDN stages fused) instead
-    # of the six-stage staged pipeline.  Only effective when VLLM_ASCEND_PTO_CHUNK_GDN=1.
-    # 0 (default): six-stage staged pipeline; 1: fused single-launch megakernel.
-    "VLLM_ASCEND_PTO_CHUNK_GDN_MEGAKERNEL": lambda: bool(int(os.getenv("VLLM_ASCEND_PTO_CHUNK_GDN_MEGAKERNEL", "0"))),
 }
 
 # end-env-vars-definition
