@@ -6,8 +6,7 @@
 
 ## Summary
 
-Integrates a Bisheng-JIT-compiled fused PTO (Parallel Tile Operator) megakernel
-for the **chunk GatedDeltaNet (GDN)** recurrent layer used in Qwen3.5 and
+Integrate fused PTO megakernel for the **chunk GatedDeltaNet (GDN)** used in Qwen3.5 and
 Qwen3.6 models, replacing the default Triton implementation during prefill.
 
 Key outcomes:
